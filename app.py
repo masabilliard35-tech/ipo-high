@@ -1,0 +1,178 @@
+"""上場来高値スクリーナー（Streamlit）。
+data/rows.json を読み、フィルタ表示。銘柄を選ぶとチャートを yfinance からライブ取得して描画。
+"""
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import streamlit.components.v1 as components
+import yfinance as yf
+from plotly.subplots import make_subplots
+
+CROSSHAIR_JS = """
+<script>
+(function(){
+  var gd=document.getElementById('gd');
+  if(!gd) return;
+  function fmtDate(v){var d=new Date(v);return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
+  function fmtNum(v){return Math.abs(v)>=100?Math.round(v).toLocaleString():(Math.round(v*100)/100).toString();}
+  function yAxes(fl){var a=[];Object.keys(fl).forEach(function(k){if(/^yaxis(\\d+)?$/.test(k)){a.push(fl[k]);}});return a;}
+  var ov=document.createElement('div');
+  ov.style.cssText='position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;z-index:5;';
+  var vline=document.createElement('div');vline.style.cssText='position:absolute;border-left:1px dotted #aaa;display:none;';
+  var hline=document.createElement('div');hline.style.cssText='position:absolute;border-top:1px dotted #aaa;display:none;';
+  var dlab=document.createElement('div');dlab.style.cssText='position:absolute;background:#444;color:#fff;font:11px sans-serif;padding:1px 5px;border:1px solid #888;display:none;transform:translateX(-50%);white-space:nowrap;';
+  var plab=document.createElement('div');plab.style.cssText='position:absolute;background:#c0392b;color:#fff;font:11px sans-serif;padding:1px 5px;display:none;white-space:nowrap;';
+  ov.appendChild(vline);ov.appendChild(hline);ov.appendChild(dlab);ov.appendChild(plab);
+  gd.style.position='relative';gd.appendChild(ov);
+  function hide(){vline.style.display=hline.style.display=dlab.style.display=plab.style.display='none';}
+  gd.addEventListener('mousemove',function(e){
+    var fl=gd._fullLayout;if(!fl||!fl.xaxis){hide();return;}
+    var rect=gd.getBoundingClientRect();
+    var mx=e.clientX-rect.left,my=e.clientY-rect.top;
+    var xa=fl.xaxis,xl=xa._offset,xr=xa._offset+xa._length;
+    if(mx<xl||mx>xr){hide();return;}
+    var yas=yAxes(fl),top=1e9,bot=-1e9;
+    for(var i=0;i<yas.length;i++){top=Math.min(top,yas[i]._offset);bot=Math.max(bot,yas[i]._offset+yas[i]._length);}
+    if(my<top||my>bot){hide();return;}
+    vline.style.display='block';vline.style.left=mx+'px';vline.style.top=top+'px';vline.style.height=(bot-top)+'px';
+    dlab.style.display='block';dlab.style.left=mx+'px';dlab.style.top=(bot+3)+'px';dlab.textContent=fmtDate(xa.p2d(mx-xa._offset));
+    var cax=null;for(var j=0;j<yas.length;j++){if(my>=yas[j]._offset&&my<=yas[j]._offset+yas[j]._length){cax=yas[j];break;}}
+    if(cax){
+      hline.style.display='block';hline.style.left=xl+'px';hline.style.top=my+'px';hline.style.width=(xr-xl)+'px';
+      var yData=cax.p2d(my-cax._offset),right=cax.side==='right';
+      plab.style.display='block';plab.style.top=my+'px';plab.textContent=fmtNum(yData);
+      if(right){plab.style.left=(xr+1)+'px';plab.style.transform='translateY(-50%)';}
+      else{plab.style.left=(xl-1)+'px';plab.style.transform='translate(-100%,-50%)';}
+    }else{hline.style.display=plab.style.display='none';}
+  });
+  gd.addEventListener('mouseleave',hide);
+})();
+</script>
+"""
+
+HERE = Path(__file__).parent
+DATA = HERE / "data" / "rows.json"
+
+st.set_page_config(page_title="上場来高値 スクリーナー", layout="wide")
+
+
+@st.cache_data(ttl=3600)
+def load():
+    return json.loads(DATA.read_text(encoding="utf-8"))
+
+
+def sma(s, n):
+    return s.rolling(n).mean()
+
+
+def rsi(s, n=14):
+    d = s.diff()
+    up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    return 100 - 100 / (1 + up / dn.replace(0, np.nan))
+
+
+def chart(sym, name, tf):
+    period = {"日足": "1y", "週足": "3y", "月足": "10y"}[tf]
+    interval = {"日足": "1d", "週足": "1wk", "月足": "1mo"}[tf]
+    df = yf.Ticker(sym).history(period=period, interval=interval, auto_adjust=True)
+    if df is None or df.empty:
+        st.info("チャートデータを取得できませんでした。")
+        return
+    df = df.dropna(subset=["Close"])
+    c = df["Close"]
+    mid = c.rolling(20).mean()
+    sd = c.rolling(20).std()
+    macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
+    signal = macd.ewm(span=9, adjust=False).mean()
+
+    fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
+                        row_heights=[0.5, 0.16, 0.18, 0.16], vertical_spacing=0.03)
+    fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"],
+                                 low=df["Low"], close=c, name="株価",
+                                 increasing_line_color="#d33", decreasing_line_color="#39c"), 1, 1)
+    for n, col in [(25, "#c99a16"), (50, "#c4382d"), (100, "#2e8b57"), (200, "#2e6fa7")]:
+        fig.add_trace(go.Scatter(x=df.index, y=sma(c, n), name=f"SMA{n}",
+                                 line=dict(width=1, color=col)), 1, 1)
+    fig.add_trace(go.Scatter(x=df.index, y=mid + 2 * sd, name="BB+", line=dict(width=1, color="rgba(140,143,163,.6)")), 1, 1)
+    fig.add_trace(go.Scatter(x=df.index, y=mid - 2 * sd, name="BB-", line=dict(width=1, color="rgba(140,143,163,.6)")), 1, 1)
+    vol_col = np.where(c >= df["Open"], "#d33", "#39c")
+    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="出来高", marker_color=vol_col), 2, 1)
+    fig.add_trace(go.Bar(x=df.index, y=macd - signal, name="MACD Hist", marker_color="#888"), 3, 1)
+    fig.add_trace(go.Scatter(x=df.index, y=macd, name="MACD", line=dict(width=1, color="#2e6fa7")), 3, 1)
+    fig.add_trace(go.Scatter(x=df.index, y=signal, name="Signal", line=dict(width=1, color="#c4382d")), 3, 1)
+    fig.add_trace(go.Scatter(x=df.index, y=rsi(c), name="RSI", line=dict(width=1, color="#2e8b57")), 4, 1)
+    fig.add_hline(y=70, line=dict(width=0.6, dash="dot", color="#888"), row=4, col=1)
+    fig.add_hline(y=30, line=dict(width=0.6, dash="dot", color="#888"), row=4, col=1)
+    for tr in fig.data:                       # RSI以外はツールチップを出さない
+        if getattr(tr, "name", "") != "RSI":
+            tr.hoverinfo = "skip"
+    fig.update_layout(height=720, template="plotly_dark", xaxis_rangeslider_visible=False,
+                      margin=dict(l=55, r=10, t=8, b=28), showlegend=False,
+                      hovermode="closest", dragmode="pan")
+    html = fig.to_html(include_plotlyjs="cdn", full_html=True, div_id="gd",
+                       config={"displayModeBar": False, "responsive": True,
+                               "scrollZoom": True})
+    html = html.replace("</body>", CROSSHAIR_JS + "</body>")
+    components.html(html, height=740, scrolling=False)
+
+
+data = load()
+df = pd.DataFrame(data["rows"])
+
+st.title("上場来高値 スクリーナー")
+st.caption(f"条件：上場5か月〜3年 × 最初の2か月を除外した上場来高値を更新中　"
+           f"｜ データ日 {data['date']}　｜ 母集団 {data['universe']:,} 中 {data['qualified']} 銘柄が該当")
+
+with st.sidebar:
+    st.header("絞り込み")
+    since_opt = {"当日": 0, "5日以内": 5, "10日以内": 10, "1ヶ月以内": 21, "60日以内": 60}
+    since_lbl = st.radio("上場来高値からの経過", list(since_opt), index=2)
+    vol_lbl = st.radio("出来高倍率", ["指定なし", "1.5〜5倍", "1.5倍以上", "5倍超"], index=0)
+    caps = st.multiselect("時価総額（億円）", ["〜50", "50〜300", "300〜1000", "1000〜"], [])
+    secs = st.multiselect("業種", sorted(df["sec"].unique()) if len(df) else [], [])
+    capital = st.number_input("総資金（円）", value=5_000_000, step=500_000)
+
+m = df["since"] <= since_opt[since_lbl]
+if vol_lbl == "1.5〜5倍":
+    m &= df["vol"].between(1.5, 5, inclusive="left")
+elif vol_lbl == "1.5倍以上":
+    m &= df["vol"] >= 1.5
+elif vol_lbl == "5倍超":
+    m &= df["vol"] >= 5
+if caps:
+    rng = {"〜50": (0, 50), "50〜300": (50, 300), "300〜1000": (300, 1000), "1000〜": (1000, 9e9)}
+    cm = pd.Series(False, index=df.index)
+    for c in caps:
+        lo, hi = rng[c]
+        cm |= df["cap"].between(lo, hi, inclusive="left")
+    m &= cm
+if secs:
+    m &= df["sec"].isin(secs)
+
+view = df[m].copy().sort_values("since")
+lim = capital * 0.25
+view["買える"] = np.where(view["unit"] <= lim, "○", "×(25%超)")
+
+st.subheader(f"該当 {len(view)} 銘柄")
+show = view[["sym", "name", "sec", "since", "listed", "ageM", "cap", "price", "unit",
+             "買える", "fromHigh", "vol", "ma25"]].rename(columns={
+    "sym": "コード", "name": "銘柄", "sec": "業種", "since": "経過日", "listed": "上場日",
+    "ageM": "上場(月)", "cap": "時価総額(億)", "price": "株価", "unit": "単元(円)",
+    "fromHigh": "高値差%", "vol": "出来高倍", "ma25": "25日線%"})
+st.dataframe(show, use_container_width=True, hide_index=True, height=460)
+
+st.subheader("チャート")
+col1, col2 = st.columns([3, 1])
+pick = col1.selectbox("銘柄を選択", view["sym"] + "  " + view["name"] if len(view) else [""])
+tf = col2.radio("足", ["日足", "週足", "月足"], horizontal=True)
+if len(view) and pick:
+    sym = pick.split("  ")[0]
+    name = view[view["sym"] == sym]["name"].iloc[0]
+    chart(sym, name, tf)
+
+st.caption("スクリーニング結果であり推奨銘柄ではありません。上場来高値は上場後2か月を除外して算出しています。")
